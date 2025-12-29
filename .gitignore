@@ -1,0 +1,10 @@
+.DS_Store
+.claude
+__pycache__
+.env
+exports/*
+data/*
+*.quality_report.txt
+*.normalization_report.txt
+*.log
+old
