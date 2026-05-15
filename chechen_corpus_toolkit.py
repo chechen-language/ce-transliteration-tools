@@ -20,13 +20,19 @@ Modes:
 import json
 import csv
 import argparse
+import gzip
+import shutil
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import Counter
 
 from chechen_text_processor import ChechenTextProcessor
+
+DEFAULT_CORPUS_URL = "https://dosham-corpora.s3.eu-central-2.amazonaws.com/sources/latest.json.gz"
+CACHE_DIR = Path(".cache")
 
 
 class CorpusAnalyzer:
@@ -404,31 +410,97 @@ class ReportGenerator:
         return lines
 
 
+class CorpusSource:
+    """Resolves a corpus source (URL or local path) to a readable local file.
+
+    URLs are downloaded into CACHE_DIR and reused on subsequent runs; pass
+    refresh=True to force re-download. Gzip-compressed files (.gz) are
+    decompressed transparently.
+    """
+
+    def __init__(self, source: str, refresh: bool = False, cache_dir: Path = CACHE_DIR):
+        self.source = source
+        self.refresh = refresh
+        self.cache_dir = cache_dir
+
+    @staticmethod
+    def is_url(source: str) -> bool:
+        return source.startswith(("http://", "https://"))
+
+    def resolve(self, printer=print) -> Path:
+        """Return a local Path to the (decompressed) JSON file."""
+        if self.is_url(self.source):
+            local = self._download(printer)
+        else:
+            local = Path(self.source)
+            if not local.exists():
+                raise FileNotFoundError(f"File '{self.source}' not found")
+
+        if local.suffix == ".gz":
+            return self._decompress(local, printer)
+        return local
+
+    def _download(self, printer) -> Path:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        filename = self.source.rsplit("/", 1)[-1] or "corpus.json"
+        cached = self.cache_dir / filename
+
+        if cached.exists() and not self.refresh:
+            printer(f"Using cached corpus: {cached}")
+            return cached
+
+        printer(f"Downloading corpus from {self.source} ...")
+        with urllib.request.urlopen(self.source) as response, open(cached, "wb") as out:
+            shutil.copyfileobj(response, out)
+        printer(f"Saved to cache: {cached}")
+        return cached
+
+    def _decompress(self, gz_path: Path, printer) -> Path:
+        decompressed = gz_path.with_suffix("")
+        if (
+            decompressed.exists()
+            and not self.refresh
+            and decompressed.stat().st_mtime >= gz_path.stat().st_mtime
+        ):
+            return decompressed
+
+        printer(f"Decompressing {gz_path.name} ...")
+        with gzip.open(gz_path, "rb") as src, open(decompressed, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return decompressed
+
+
 class ChechenCorpusToolkit:
     """Main toolkit class orchestrating all functionality"""
-    
-    def __init__(self):
+
+    def __init__(self, refresh: bool = False):
         self.analyzer = None
         self.normalizer = None
-    
+        self.refresh = refresh
+
     def _print(self, message: str) -> None:
         """Print message to console."""
         print(message)
-        
-    def load_corpus(self, file_path: str) -> List[Dict]:
-        """Load JSON corpus data from file."""
+
+    def load_corpus(self, source: str) -> List[Dict]:
+        """Load JSON corpus data from a local file path or URL.
+
+        URLs are downloaded to CACHE_DIR and reused; .gz files are
+        decompressed transparently.
+        """
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
+            local_path = CorpusSource(source, refresh=self.refresh).resolve(self._print)
+            with open(local_path, 'r', encoding='utf-8') as file:
                 data = json.load(file)
                 if not isinstance(data, list):
                     raise ValueError("Corpus must be a JSON array")
                 self._print(f"Loaded {len(data)} texts from corpus")
                 return data
-        except FileNotFoundError:
-            print(f"Error: File '{file_path}' not found", file=sys.stderr)
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
         except json.JSONDecodeError as e:
-            print(f"Error: Invalid JSON in '{file_path}': {e}", file=sys.stderr)
+            print(f"Error: Invalid JSON in '{source}': {e}", file=sys.stderr)
             sys.exit(1)
         except Exception as e:
             print(f"Error loading corpus: {e}", file=sys.stderr)
@@ -681,11 +753,13 @@ Examples:
     )
     
     # Required arguments
-    parser.add_argument('input_file', help='Input JSON corpus file')
-    parser.add_argument('--mode', required=True, 
+    parser.add_argument('input_file', nargs='?', default=DEFAULT_CORPUS_URL,
+                       help=f'Input JSON corpus file or URL. Supports .gz. '
+                            f'Defaults to {DEFAULT_CORPUS_URL}')
+    parser.add_argument('--mode', required=True,
                        choices=['analyze', 'process', 'fix-corpus', 'all'],
                        help='Processing mode')
-    
+
     # Common options
     parser.add_argument('--output-dir', default='exports',
                        help='Output directory (default: exports)')
@@ -694,6 +768,8 @@ Examples:
                        help='Minimum word frequency (default: 1)')
     parser.add_argument('--save-report', action='store_true',
                        help='Save quality/processing report')
+    parser.add_argument('--refresh', action='store_true',
+                       help='Force re-download of remote corpus, bypassing cache')
     
     # Mode-specific options
     parser.add_argument('--export', action='append', 
@@ -718,7 +794,7 @@ Examples:
         sys.exit(1)
     
     # Initialize toolkit
-    toolkit = ChechenCorpusToolkit()
+    toolkit = ChechenCorpusToolkit(refresh=args.refresh)
     
     # Execute based on mode
     start_time = time.time()
