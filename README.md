@@ -85,7 +85,10 @@ python chechen_corpus_toolkit.py input.json --mode process --export palochka
 # Keyman keyboard predictions (optimized 2-30 char words)
 python chechen_corpus_toolkit.py input.json --mode process --export keyman
 
-# Both exports with detailed reporting
+# AOSP combined wordlist for Android keyboards (HeliBoard, OpenBoard)
+python chechen_corpus_toolkit.py input.json --mode process --export aosp
+
+# All exports with detailed reporting
 python chechen_corpus_toolkit.py input.json --mode process --export all --save-report --min-frequency 2
 ```
 
@@ -93,7 +96,8 @@ python chechen_corpus_toolkit.py input.json --mode process --export all --save-r
 
 - **`palochka`**: Words containing ӏ (Chechen palochka) for iOS text replacement shortcuts
 - **`keyman`**: Optimized for Keyman keyboard software predictions (1-27 chars, filtered for quality)
-- **`all`**: Generates both palochka and keyman exports
+- **`aosp`**: AOSP `.combined` wordlist for Android open-source keyboards (HeliBoard, OpenBoard) — frequencies remapped to the 0–255 log scale
+- **`all`**: Generates palochka, keyman, and aosp exports
 
 ### Corpus Normalization
 Apply character normalizations to source corpus:
@@ -139,8 +143,25 @@ python chechen_corpus_toolkit.py input.json --mode all --export all --min-freque
 exports/
 ├── palochka_words.tsv      # iOS text replacement shortcuts
 ├── keyman_wordlist.tsv     # Keyman keyboard predictions
+├── main_ce.combined        # AOSP combined wordlist for Android keyboards
 ├── analysis_report.txt     # Quality analysis results
 └── processing_report.txt   # Processing details
+```
+
+**AOSP `.combined` Format:**
+```
+dictionary=main:ce,locale=ce,description=Chechen,date=1746316800,version=1
+ word=а,f=255
+ word=ца,f=221
+ word=ду,f=207
+```
+
+Frequencies are mapped from raw counts to the AOSP 0–255 logarithmic scale:
+`f = round(255 * log(count + 1) / log(max_count + 1))`. The file can be compiled
+to a binary `.dict` with [aosp-dictionary-tools](https://github.com/remi0s/aosp-dictionary-tools):
+
+```bash
+java -jar dicttool_aosp.jar makedict -s exports/main_ce.combined -d main_ce.dict
 ```
 
 **TSV Format:**
@@ -221,6 +242,15 @@ Create optimized wordlists for [Keyman keyboard predictions](https://help.keyman
 ```bash
 python chechen_corpus_toolkit.py corpus.json --mode process --export keyman --min-frequency 2
 # Output: exports/keyman_wordlist.tsv
+```
+
+### AOSP Android Keyboards (HeliBoard / OpenBoard)
+
+Create a `.combined` dictionary for [aosp-dictionaries](https://codeberg.org/Helium314/aosp-dictionaries)-compatible
+Android keyboards such as HeliBoard and OpenBoard:
+```bash
+python chechen_corpus_toolkit.py corpus.json --mode process --export aosp --min-frequency 2
+# Output: exports/main_ce.combined
 ```
 
 ### Corpus Structure
