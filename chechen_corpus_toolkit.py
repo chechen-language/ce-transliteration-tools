@@ -21,6 +21,7 @@ import json
 import csv
 import argparse
 import gzip
+import math
 import shutil
 import sys
 import time
@@ -143,13 +144,13 @@ class ExportGenerator:
         return [(word, count) for word, count in wordlist if 'ӏ' in word or 'Ӏ' in word]
     
     @staticmethod
-    def filter_keyman_words(wordlist: List[Tuple[str, int]], 
+    def filter_keyman_words(wordlist: List[Tuple[str, int]],
                            min_length: int = 1, max_length: int = 27) -> List[Tuple[str, int]]:
         """Filter words optimized for Keyman keyboard predictions."""
         # Valid single-letter Chechen words
         valid_single_letters = {'а', 'и', 'я', 'ю'}
         filtered_words = []
-        
+
         for word, count in wordlist:
             # Handle single character words
             if len(word) == 1:
@@ -157,23 +158,47 @@ class ExportGenerator:
                 if word in valid_single_letters:
                     filtered_words.append((word, count))
                 continue
-            
+
             # Remove words that are just numbers
             if word.isdigit():
                 continue
-            
-            
+
+
             # For Keyman: apply length filter
             if not (min_length <= len(word) <= max_length):
                 continue
-            
+
             # Remove words with excessive repetition (like "ааа")
             if len(set(word)) == 1 and len(word) > 2:
                 continue
-            
+
             filtered_words.append((word, count))
-        
+
         return filtered_words
+
+    @staticmethod
+    def map_to_aosp_frequencies(wordlist: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+        """Map raw counts to AOSP's 0–255 logarithmic frequency scale.
+
+        f = round(255 * log(count + 1) / log(max_count + 1))
+        Returns the filtered (Keyman-style) wordlist with counts replaced by
+        AOSP frequencies, sorted by frequency descending then word ascending.
+        """
+        filtered = ExportGenerator.filter_keyman_words(wordlist)
+        if not filtered:
+            return []
+
+        max_count = max(count for _, count in filtered)
+        denom = math.log(max_count + 1)
+        if denom == 0:
+            return [(word, 255) for word, _ in filtered]
+
+        scaled = [
+            (word, max(0, min(255, round(255 * math.log(count + 1) / denom))))
+            for word, count in filtered
+        ]
+        scaled.sort(key=lambda item: (-item[1], item[0]))
+        return scaled
 
 
 class CorpusNormalizer:
@@ -516,6 +541,40 @@ class ChechenCorpusToolkit:
             print(f"Error saving JSON: {e}", file=sys.stderr)
             sys.exit(1)
     
+    def save_aosp_combined(self, scaled_wordlist: List[Tuple[str, int]], file_path: str,
+                           locale: str = "ce", description: str = "Chechen",
+                           silent: bool = False) -> Dict[str, Any]:
+        """Save wordlist in AOSP .combined format for Android keyboards.
+
+        scaled_wordlist must contain (word, aosp_frequency) tuples where
+        aosp_frequency is in the 0–255 range (use
+        ExportGenerator.map_to_aosp_frequencies).
+        """
+        try:
+            header = (
+                f"dictionary=main:{locale},locale={locale},"
+                f"description={description},date={int(time.time())},version=1"
+            )
+            with open(file_path, 'w', encoding='utf-8', newline='\n') as file:
+                file.write(header + "\n")
+                for word, freq in scaled_wordlist:
+                    file.write(f" word={word},f={freq}\n")
+
+            export_info = {
+                'word_count': len(scaled_wordlist),
+                'file_path': file_path,
+                'message': f"Exported {len(scaled_wordlist)} words to {file_path}",
+            }
+
+            if not silent:
+                self._print(export_info['message'])
+
+            return export_info
+
+        except Exception as e:
+            print(f"Error saving AOSP .combined file: {e}", file=sys.stderr)
+            sys.exit(1)
+
     def save_tsv(self, wordlist: List[Tuple[str, int]], file_path: str, silent: bool = False) -> Dict[str, any]:
         """Save wordlist to TSV file.
         
@@ -617,15 +676,19 @@ class ChechenCorpusToolkit:
             if export_type == 'palochka':
                 filtered_words = export_generator.filter_palochka_words(wordlist)
                 output_file = f"{output_dir}/palochka_words.tsv"
+                info = self.save_tsv(filtered_words, output_file, silent=True)
             elif export_type == 'keyman':
                 filtered_words = export_generator.filter_keyman_words(wordlist, min_length=1, max_length=27)
                 output_file = f"{output_dir}/keyman_wordlist.tsv"
+                info = self.save_tsv(filtered_words, output_file, silent=True)
+            elif export_type == 'aosp':
+                filtered_words = export_generator.map_to_aosp_frequencies(wordlist)
+                output_file = f"{output_dir}/main_ce.combined"
+                info = self.save_aosp_combined(filtered_words, output_file, silent=True)
             else:
                 print(f"Warning: Unknown export type '{export_type}', skipping")
                 continue
-            
-            # Save export (silent mode - collect info for later display)
-            info = self.save_tsv(filtered_words, output_file, silent=True)
+
             exports[export_type] = filtered_words
             export_info[export_type] = info
         
@@ -772,8 +835,8 @@ Examples:
                        help='Force re-download of remote corpus, bypassing cache')
     
     # Mode-specific options
-    parser.add_argument('--export', action='append', 
-                       choices=['palochka', 'keyman', 'all'],
+    parser.add_argument('--export', action='append',
+                       choices=['palochka', 'keyman', 'aosp', 'all'],
                        help='Export type(s) to generate (can be used multiple times)')
     parser.add_argument('--output', help='Output file (for fix-corpus mode)')
     
@@ -787,7 +850,7 @@ Examples:
         
         # Handle 'all' export type
         if 'all' in args.export:
-            args.export = ['palochka', 'keyman']
+            args.export = ['palochka', 'keyman', 'aosp']
     
     if args.mode == 'fix-corpus' and not args.output:
         print("Error: --output is required for fix-corpus mode", file=sys.stderr)
