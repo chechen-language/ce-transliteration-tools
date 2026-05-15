@@ -6,7 +6,7 @@ Advanced toolkit for processing Chechen language corpus data with sophisticated 
 [![Python](https://img.shields.io/badge/Python-3.7%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Primary Data Source**: [corpora.dosham.info](https://corpora.dosham.info) - supports any JSON corpus with proper structure.
+**Primary Data Source**: [corpora.dosham.info](https://corpora.dosham.info) — by default the toolkit fetches the latest published snapshot from `https://dosham-corpora.s3.eu-central-2.amazonaws.com/sources/latest.json.gz`. Local JSON/`.json.gz` files and other URLs are also accepted.
 
 ## Key Features
 
@@ -23,18 +23,32 @@ Advanced toolkit for processing Chechen language corpus data with sophisticated 
 # Install dependencies
 pip install -r requirements.txt
 
-# Quality analysis
-python chechen_corpus_toolkit.py data/corpus.json --mode analyze --save-report
+# Quality analysis (uses the default remote corpus)
+python chechen_corpus_toolkit.py --mode analyze --save-report
 
 # Generate iOS text replacement wordlist
-python chechen_corpus_toolkit.py data/corpus.json --mode process --export palochka
+python chechen_corpus_toolkit.py --mode process --export palochka
 
 # Generate Keyman wordlist
-python chechen_corpus_toolkit.py data/corpus.json --mode process --export keyman
+python chechen_corpus_toolkit.py --mode process --export keyman
 
 # Generate all exports
-python chechen_corpus_toolkit.py data/corpus.json --mode process --export all
+python chechen_corpus_toolkit.py --mode process --export all
+
+# Force re-download of the remote corpus (bypass cache)
+python chechen_corpus_toolkit.py --mode analyze --refresh
+
+# Use a local file instead of the default URL
+python chechen_corpus_toolkit.py data/corpus.json --mode analyze
 ```
+
+## Corpus Source
+
+`input_file` is optional. When omitted, the toolkit downloads the latest published
+corpus from `https://dosham-corpora.s3.eu-central-2.amazonaws.com/sources/latest.json.gz`,
+caches it under `.cache/`, and reuses the cached copy on subsequent runs. `.gz` files
+(remote or local) are decompressed automatically. Pass `--refresh` to force a fresh
+download.
 
 ## Processing Modes
 
