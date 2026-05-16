@@ -20,13 +20,20 @@ Modes:
 import json
 import csv
 import argparse
+import gzip
+import math
+import shutil
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import Counter
 
 from chechen_text_processor import ChechenTextProcessor
+
+DEFAULT_CORPUS_URL = "https://dosham-corpora.s3.eu-central-2.amazonaws.com/sources/latest.json.gz"
+CACHE_DIR = Path(".cache")
 
 
 class CorpusAnalyzer:
@@ -137,13 +144,13 @@ class ExportGenerator:
         return [(word, count) for word, count in wordlist if 'ӏ' in word or 'Ӏ' in word]
     
     @staticmethod
-    def filter_keyman_words(wordlist: List[Tuple[str, int]], 
+    def filter_keyman_words(wordlist: List[Tuple[str, int]],
                            min_length: int = 1, max_length: int = 27) -> List[Tuple[str, int]]:
         """Filter words optimized for Keyman keyboard predictions."""
         # Valid single-letter Chechen words
         valid_single_letters = {'а', 'и', 'я', 'ю'}
         filtered_words = []
-        
+
         for word, count in wordlist:
             # Handle single character words
             if len(word) == 1:
@@ -151,23 +158,47 @@ class ExportGenerator:
                 if word in valid_single_letters:
                     filtered_words.append((word, count))
                 continue
-            
+
             # Remove words that are just numbers
             if word.isdigit():
                 continue
-            
-            
+
+
             # For Keyman: apply length filter
             if not (min_length <= len(word) <= max_length):
                 continue
-            
+
             # Remove words with excessive repetition (like "ааа")
             if len(set(word)) == 1 and len(word) > 2:
                 continue
-            
+
             filtered_words.append((word, count))
-        
+
         return filtered_words
+
+    @staticmethod
+    def map_to_aosp_frequencies(wordlist: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+        """Map raw counts to AOSP's 0–255 logarithmic frequency scale.
+
+        f = round(255 * log(count + 1) / log(max_count + 1))
+        Returns the filtered (Keyman-style) wordlist with counts replaced by
+        AOSP frequencies, sorted by frequency descending then word ascending.
+        """
+        filtered = ExportGenerator.filter_keyman_words(wordlist)
+        if not filtered:
+            return []
+
+        max_count = max(count for _, count in filtered)
+        denom = math.log(max_count + 1)
+        if denom == 0:
+            return [(word, 255) for word, _ in filtered]
+
+        scaled = [
+            (word, max(0, min(255, round(255 * math.log(count + 1) / denom))))
+            for word, count in filtered
+        ]
+        scaled.sort(key=lambda item: (-item[1], item[0]))
+        return scaled
 
 
 class CorpusNormalizer:
@@ -404,31 +435,97 @@ class ReportGenerator:
         return lines
 
 
+class CorpusSource:
+    """Resolves a corpus source (URL or local path) to a readable local file.
+
+    URLs are downloaded into CACHE_DIR and reused on subsequent runs; pass
+    refresh=True to force re-download. Gzip-compressed files (.gz) are
+    decompressed transparently.
+    """
+
+    def __init__(self, source: str, refresh: bool = False, cache_dir: Path = CACHE_DIR):
+        self.source = source
+        self.refresh = refresh
+        self.cache_dir = cache_dir
+
+    @staticmethod
+    def is_url(source: str) -> bool:
+        return source.startswith(("http://", "https://"))
+
+    def resolve(self, printer=print) -> Path:
+        """Return a local Path to the (decompressed) JSON file."""
+        if self.is_url(self.source):
+            local = self._download(printer)
+        else:
+            local = Path(self.source)
+            if not local.exists():
+                raise FileNotFoundError(f"File '{self.source}' not found")
+
+        if local.suffix == ".gz":
+            return self._decompress(local, printer)
+        return local
+
+    def _download(self, printer) -> Path:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        filename = self.source.rsplit("/", 1)[-1] or "corpus.json"
+        cached = self.cache_dir / filename
+
+        if cached.exists() and not self.refresh:
+            printer(f"Using cached corpus: {cached}")
+            return cached
+
+        printer(f"Downloading corpus from {self.source} ...")
+        with urllib.request.urlopen(self.source) as response, open(cached, "wb") as out:
+            shutil.copyfileobj(response, out)
+        printer(f"Saved to cache: {cached}")
+        return cached
+
+    def _decompress(self, gz_path: Path, printer) -> Path:
+        decompressed = gz_path.with_suffix("")
+        if (
+            decompressed.exists()
+            and not self.refresh
+            and decompressed.stat().st_mtime >= gz_path.stat().st_mtime
+        ):
+            return decompressed
+
+        printer(f"Decompressing {gz_path.name} ...")
+        with gzip.open(gz_path, "rb") as src, open(decompressed, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return decompressed
+
+
 class ChechenCorpusToolkit:
     """Main toolkit class orchestrating all functionality"""
-    
-    def __init__(self):
+
+    def __init__(self, refresh: bool = False):
         self.analyzer = None
         self.normalizer = None
-    
+        self.refresh = refresh
+
     def _print(self, message: str) -> None:
         """Print message to console."""
         print(message)
-        
-    def load_corpus(self, file_path: str) -> List[Dict]:
-        """Load JSON corpus data from file."""
+
+    def load_corpus(self, source: str) -> List[Dict]:
+        """Load JSON corpus data from a local file path or URL.
+
+        URLs are downloaded to CACHE_DIR and reused; .gz files are
+        decompressed transparently.
+        """
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
+            local_path = CorpusSource(source, refresh=self.refresh).resolve(self._print)
+            with open(local_path, 'r', encoding='utf-8') as file:
                 data = json.load(file)
                 if not isinstance(data, list):
                     raise ValueError("Corpus must be a JSON array")
                 self._print(f"Loaded {len(data)} texts from corpus")
                 return data
-        except FileNotFoundError:
-            print(f"Error: File '{file_path}' not found", file=sys.stderr)
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
         except json.JSONDecodeError as e:
-            print(f"Error: Invalid JSON in '{file_path}': {e}", file=sys.stderr)
+            print(f"Error: Invalid JSON in '{source}': {e}", file=sys.stderr)
             sys.exit(1)
         except Exception as e:
             print(f"Error loading corpus: {e}", file=sys.stderr)
@@ -444,6 +541,40 @@ class ChechenCorpusToolkit:
             print(f"Error saving JSON: {e}", file=sys.stderr)
             sys.exit(1)
     
+    def save_aosp_combined(self, scaled_wordlist: List[Tuple[str, int]], file_path: str,
+                           locale: str = "ce", description: str = "Chechen",
+                           silent: bool = False) -> Dict[str, Any]:
+        """Save wordlist in AOSP .combined format for Android keyboards.
+
+        scaled_wordlist must contain (word, aosp_frequency) tuples where
+        aosp_frequency is in the 0–255 range (use
+        ExportGenerator.map_to_aosp_frequencies).
+        """
+        try:
+            header = (
+                f"dictionary=main:{locale},locale={locale},"
+                f"description={description},date={int(time.time())},version=1"
+            )
+            with open(file_path, 'w', encoding='utf-8', newline='\n') as file:
+                file.write(header + "\n")
+                for word, freq in scaled_wordlist:
+                    file.write(f" word={word},f={freq}\n")
+
+            export_info = {
+                'word_count': len(scaled_wordlist),
+                'file_path': file_path,
+                'message': f"Exported {len(scaled_wordlist)} words to {file_path}",
+            }
+
+            if not silent:
+                self._print(export_info['message'])
+
+            return export_info
+
+        except Exception as e:
+            print(f"Error saving AOSP .combined file: {e}", file=sys.stderr)
+            sys.exit(1)
+
     def save_tsv(self, wordlist: List[Tuple[str, int]], file_path: str, silent: bool = False) -> Dict[str, any]:
         """Save wordlist to TSV file.
         
@@ -545,15 +676,19 @@ class ChechenCorpusToolkit:
             if export_type == 'palochka':
                 filtered_words = export_generator.filter_palochka_words(wordlist)
                 output_file = f"{output_dir}/palochka_words.tsv"
+                info = self.save_tsv(filtered_words, output_file, silent=True)
             elif export_type == 'keyman':
                 filtered_words = export_generator.filter_keyman_words(wordlist, min_length=1, max_length=27)
                 output_file = f"{output_dir}/keyman_wordlist.tsv"
+                info = self.save_tsv(filtered_words, output_file, silent=True)
+            elif export_type == 'aosp':
+                filtered_words = export_generator.map_to_aosp_frequencies(wordlist)
+                output_file = f"{output_dir}/main_ce.combined"
+                info = self.save_aosp_combined(filtered_words, output_file, silent=True)
             else:
                 print(f"Warning: Unknown export type '{export_type}', skipping")
                 continue
-            
-            # Save export (silent mode - collect info for later display)
-            info = self.save_tsv(filtered_words, output_file, silent=True)
+
             exports[export_type] = filtered_words
             export_info[export_type] = info
         
@@ -681,11 +816,13 @@ Examples:
     )
     
     # Required arguments
-    parser.add_argument('input_file', help='Input JSON corpus file')
-    parser.add_argument('--mode', required=True, 
+    parser.add_argument('input_file', nargs='?', default=DEFAULT_CORPUS_URL,
+                       help=f'Input JSON corpus file or URL. Supports .gz. '
+                            f'Defaults to {DEFAULT_CORPUS_URL}')
+    parser.add_argument('--mode', required=True,
                        choices=['analyze', 'process', 'fix-corpus', 'all'],
                        help='Processing mode')
-    
+
     # Common options
     parser.add_argument('--output-dir', default='exports',
                        help='Output directory (default: exports)')
@@ -694,10 +831,12 @@ Examples:
                        help='Minimum word frequency (default: 1)')
     parser.add_argument('--save-report', action='store_true',
                        help='Save quality/processing report')
+    parser.add_argument('--refresh', action='store_true',
+                       help='Force re-download of remote corpus, bypassing cache')
     
     # Mode-specific options
-    parser.add_argument('--export', action='append', 
-                       choices=['palochka', 'keyman', 'all'],
+    parser.add_argument('--export', action='append',
+                       choices=['palochka', 'keyman', 'aosp', 'all'],
                        help='Export type(s) to generate (can be used multiple times)')
     parser.add_argument('--output', help='Output file (for fix-corpus mode)')
     
@@ -711,14 +850,14 @@ Examples:
         
         # Handle 'all' export type
         if 'all' in args.export:
-            args.export = ['palochka', 'keyman']
+            args.export = ['palochka', 'keyman', 'aosp']
     
     if args.mode == 'fix-corpus' and not args.output:
         print("Error: --output is required for fix-corpus mode", file=sys.stderr)
         sys.exit(1)
     
     # Initialize toolkit
-    toolkit = ChechenCorpusToolkit()
+    toolkit = ChechenCorpusToolkit(refresh=args.refresh)
     
     # Execute based on mode
     start_time = time.time()
